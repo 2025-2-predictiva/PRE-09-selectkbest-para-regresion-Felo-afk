@@ -45,26 +45,23 @@ def load_estimator():
 
 
 def load_estimator():
-    import os
-    import pickle
+    import os, pickle
 
     path = "homework/estimator.pickle"
     if not os.path.exists(path):
         return None
 
-    # --- 1) Deserializar con parche de compat para _RemainderColsList
+    # --- compat para _RemainderColsList al deserializar
     def _load_with_compat(fobj):
         try:
             return pickle.load(fobj)
         except AttributeError:
-            # parchear el símbolo privado si falta
             try:
                 from sklearn.compose import _column_transformer as _ct
 
                 if not hasattr(_ct, "_RemainderColsList"):
 
-                    class _RemainderColsList(list):
-                        pass
+                    class _RemainderColsList(list): ...
 
                     _RemainderColsList.__name__ = "_RemainderColsList"
                     _RemainderColsList.__qualname__ = "_RemainderColsList"
@@ -80,40 +77,79 @@ def load_estimator():
     with open(path, "rb") as f:
         est = _load_with_compat(f)
 
-    # --- 2) Envolver para alinear columnas en predict
+    # -------- Wrapper que alinea columnas antes de predecir --------
     class _AlignedEstimator:
         def __init__(self, inner):
             self._inner = inner
-            # intentar varias rutas para obtener los nombres de columnas crudas usadas en fit
-            expected = getattr(inner, "feature_names_in_", None)
-            if expected is None:
-                try:
-                    # e.g. GridSearchCV -> best_estimator_ -> named_steps['preprocess']
-                    expected = inner.best_estimator_.named_steps[
-                        "preprocess"
-                    ].feature_names_in_
-                except Exception:
+            self._expected_cols = self._infer_expected_cols(inner)
+
+        # Busca columnas de entrenamiento en varios lugares posibles
+        def _infer_expected_cols(self, inner):
+            def _get_cols(obj):
+                # 1) Estimador/pipeline completo
+                cols = getattr(obj, "feature_names_in_", None)
+                if cols is not None:
+                    return list(cols)
+                # 2) best_estimator_ (GridSearchCV)
+                be = getattr(obj, "best_estimator_", None)
+                if be is not None:
+                    cols = getattr(be, "feature_names_in_", None)
+                    if cols is not None:
+                        return list(cols)
+                # 3) named_steps (por nombre frecuente)
+                for step_name in (
+                    "preprocess",
+                    "preprocessor",
+                    "prep",
+                    "ct",
+                    "columntransformer",
+                ):
                     try:
-                        expected = inner.named_steps["preprocess"].feature_names_in_
+                        step = obj.named_steps[step_name]
+                        cols = getattr(step, "feature_names_in_", None)
+                        if cols is not None:
+                            return list(cols)
                     except Exception:
-                        expected = None
-            self._expected_cols = list(expected) if expected is not None else None
+                        pass
+                # 4) pasos dentro del pipeline
+                try:
+                    for _, step in getattr(obj, "steps", []):
+                        cols = getattr(step, "feature_names_in_", None)
+                        if cols is not None:
+                            return list(cols)
+                except Exception:
+                    pass
+                # 5) Dentro de best_estimator_.steps
+                if be is not None:
+                    try:
+                        for _, step in getattr(be, "steps", []):
+                            cols = getattr(step, "feature_names_in_", None)
+                            if cols is not None:
+                                return list(cols)
+                    except Exception:
+                        pass
+                return None
+
+            cols = _get_cols(inner)
+            if cols is None:
+                be = getattr(inner, "best_estimator_", None)
+                if be is not None:
+                    cols = _get_cols(be)
+            return list(cols) if cols is not None else None
 
         def _align(self, X):
             import pandas as pd
 
-            # Solo alineamos si es DataFrame y tenemos expected cols
             if self._expected_cols is None or not hasattr(X, "columns"):
                 return X
             X = X.copy()
-            # Añadir columnas faltantes como NA (imputers del pipeline deberían manejarlas)
-            for col in self._expected_cols:
-                if col not in X.columns:
-                    X[col] = pd.NA
-            # Quitar columnas extra y reordenar
+            # Añade columnas faltantes como NA y descarta extras; respeta el orden original de entrenamiento
+            for c in self._expected_cols:
+                if c not in X.columns:
+                    X[c] = pd.NA
             return X[self._expected_cols]
 
-        # Delegamos casi todo al estimador interno
+        # Delegación
         def predict(self, X, *args, **kwargs):
             return self._inner.predict(self._align(X), *args, **kwargs)
 
